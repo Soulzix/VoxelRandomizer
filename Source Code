@@ -1,0 +1,310 @@
+
+
+Full Source Code For Voxel Randomizer:
+---------------------------------------
+import subprocess
+import random
+import winreg
+import time
+import ctypes
+import sys
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import shutil
+import schedule
+import urllib.request
+import datetime
+
+# ------------ CONFIG -----------------
+CURRENT_VERSION = "1.0.0"
+VERSION_URL = "https://raw.githubusercontent.com/Soulzix/VoxelRandomizer/main/Versions.txt"
+EXE_NAME = "MACRandomizer.exe"
+APP_FOLDER_NAME = "MAC_Randomizer_App"
+
+# ------------ Admin check ------------
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+# ------------ MAC utilities ------------
+def random_mac():
+    mac = [0x02, 0x00, 0x00,
+           random.randint(0x00, 0xff),
+           random.randint(0x00, 0xff),
+           random.randint(0x00, 0xff)]
+    return ''.join(f'{b:02X}' for b in mac)
+
+def get_all_adapters():
+    base_path = r'SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+    adapters = []
+    try:
+        with winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE) as hklm:
+            with winreg.OpenKey(hklm, base_path) as base_key:
+                for i in range(0, 50):
+                    try:
+                        subkey_name = winreg.EnumKey(base_key, i)
+                        with winreg.OpenKey(base_key, subkey_name) as subkey:
+                            try:
+                                driver_desc = winreg.QueryValueEx(subkey, "DriverDesc")[0]
+                                net_cfg_instance_id = winreg.QueryValueEx(subkey, "NetCfgInstanceId")[0]
+                                adapters.append({
+                                    "reg_path": f"{base_path}\\{subkey_name}",
+                                    "name": driver_desc,
+                                    "net_cfg_id": net_cfg_instance_id
+                                })
+                            except FileNotFoundError:
+                                continue
+                    except OSError:
+                        break
+    except Exception:
+        pass
+    return adapters
+
+def filter_network_adapters(adapters):
+    keywords = ['wireless', 'wifi', 'wlan', '802.11', 'wi-fi', 'ethernet', 'lan']
+    return [a for a in adapters if any(k in a['name'].lower() for k in keywords)]
+
+def set_mac_in_registry(adapter_reg_path, new_mac):
+    try:
+        with winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE) as hklm:
+            with winreg.OpenKey(hklm, adapter_reg_path, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "NetworkAddress", 0, winreg.REG_SZ, new_mac)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def delete_mac_in_registry(adapter_reg_path):
+    try:
+        with winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE) as hklm:
+            with winreg.OpenKey(hklm, adapter_reg_path, 0, winreg.KEY_SET_VALUE) as key:
+                try:
+                    winreg.DeleteValue(key, "NetworkAddress")
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def disable_enable_adapter(net_cfg_id):
+    try:
+        cmd_disable = f'Get-NetAdapter | Where-Object {{ $_.InterfaceGuid -eq "{net_cfg_id}" }} | Disable-NetAdapter -Confirm:$false'
+        cmd_enable = f'Get-NetAdapter | Where-Object {{ $_.InterfaceGuid -eq "{net_cfg_id}" }} | Enable-NetAdapter -Confirm:$false'
+        subprocess.run(f'powershell -Command "{cmd_disable}"', shell=True)
+        time.sleep(3)
+        subprocess.run(f'powershell -Command "{cmd_enable}"', shell=True)
+        time.sleep(3)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+# ------------ MAC Operations ------------
+def run_operation(log_widget, btn_randomize, btn_restore, randomize=True):
+    btn_randomize.config(state=tk.DISABLED)
+    btn_restore.config(state=tk.DISABLED)
+    log_widget.insert(tk.END, "Starting operation...\n")
+    log_widget.see(tk.END)
+
+    adapters = get_all_adapters()
+    network_adapters = filter_network_adapters(adapters)
+
+    if not network_adapters:
+        messagebox.showerror("Error", "No network adapters found.")
+        btn_randomize.config(state=tk.NORMAL)
+        btn_restore.config(state=tk.NORMAL)
+        return
+
+    for adapter in network_adapters:
+        log_widget.insert(tk.END, f"Processing: {adapter['name']}\n")
+        log_widget.see(tk.END)
+
+        if randomize:
+            new_mac = random_mac()
+            success, msg = set_mac_in_registry(adapter["reg_path"], new_mac)
+            if not success:
+                log_widget.insert(tk.END, f"  Failed to set MAC: {msg}\n")
+                continue
+        else:
+            success, msg = delete_mac_in_registry(adapter["reg_path"])
+            if not success:
+                log_widget.insert(tk.END, f"  Failed to delete MAC: {msg}\n")
+                continue
+
+        success, msg = disable_enable_adapter(adapter["net_cfg_id"])
+        if success:
+            action = "Randomized" if randomize else "Restored"
+            mac_info = new_mac if randomize else "original"
+            log_widget.insert(tk.END, f"  {action} MAC to {mac_info}\n")
+        else:
+            log_widget.insert(tk.END, f"  Failed to restart adapter: {msg}\n")
+
+        log_widget.see(tk.END)
+
+    log_widget.insert(tk.END, "Operation completed.\n\n")
+    log_widget.see(tk.END)
+
+    btn_randomize.config(state=tk.NORMAL)
+    btn_restore.config(state=tk.NORMAL)
+
+# ------------ Scheduler Thread with dynamic times ------------
+def scheduler_thread(log_widget, btn_randomize, btn_restore, get_times_func):
+    import schedule
+    while True:
+        schedule.clear()
+        randomize_time, restore_time = get_times_func()
+        if randomize_time:
+            schedule.every().day.at(randomize_time).do(run_operation, log_widget, btn_randomize, btn_restore, True)
+        if restore_time:
+            schedule.every().day.at(restore_time).do(run_operation, log_widget, btn_randomize, btn_restore, False)
+        schedule.run_pending()
+        time.sleep(30)
+
+# ------------ Distribution Folder Prep ------------
+def prepare_distribution_folder():
+    save_path = filedialog.askdirectory(title="Select where to save the app folder")
+    if not save_path:
+        return None
+
+    app_folder = os.path.join(save_path, APP_FOLDER_NAME)
+    if os.path.exists(app_folder):
+        shutil.rmtree(app_folder)
+    os.makedirs(app_folder)
+
+    exe_source = os.path.join(os.getcwd(), "dist", EXE_NAME)
+    if os.path.exists(exe_source):
+        shutil.copy2(exe_source, os.path.join(app_folder, EXE_NAME))
+
+    messagebox.showinfo("Done", f"App saved to: {app_folder}")
+    return app_folder
+
+# ------------ Version Check & Update ------------
+def check_for_update(root, log_widget):
+    try:
+        with urllib.request.urlopen(VERSION_URL, timeout=5) as response:
+            latest_version = response.read().decode('utf-8').strip()
+    except Exception as e:
+        log_widget.insert(tk.END, f"Update check failed: {e}\n")
+        log_widget.see(tk.END)
+        return
+
+    if latest_version != CURRENT_VERSION:
+        def prompt_update():
+            if messagebox.askyesno("Update Available",
+                                   f"A new version ({latest_version}) is available.\nPlease update to stay compatible.\n\nUpdate now?"):
+                import webbrowser
+                webbrowser.open("https://github.com/Soulzix/VoxelRandomizer/releases")
+                root.destroy()
+            else:
+                log_widget.insert(tk.END, "User chose to ignore update.\n")
+                log_widget.see(tk.END)
+        root.after(0, prompt_update)
+    else:
+        log_widget.insert(tk.END, "You are running the latest version.\n")
+        log_widget.see(tk.END)
+
+# ------------ Validate time format ------------
+def validate_time_format(t):
+    try:
+        datetime.datetime.strptime(t, '%H:%M')
+        return True
+    except ValueError:
+        return False
+
+# ------------ GUI Setup ------------
+def setup_gui():
+    root = tk.Tk()
+    root.title("MAC Address Randomizer")
+    root.geometry("700x500")
+    root.configure(bg="#1e1e1e")
+    root.resizable(True, True)
+
+    style = ttk.Style(root)
+    style.theme_use('clam')
+
+    style.configure('Green.TButton',
+                    background='#28a745',
+                    foreground='white',
+                    font=('Segoe UI', 11, 'bold'),
+                    padding=10)
+    style.map('Green.TButton',
+              background=[('active', '#218838'), ('disabled', '#1c6c31')])
+
+    label = tk.Label(root, text="Randomize or Restore MAC Address (Wi-Fi & Ethernet)",
+                     font=("Segoe UI", 16), bg="#1e1e1e", fg="white")
+    label.pack(pady=15)
+
+    # Time settings frame
+    time_frame = tk.Frame(root, bg="#1e1e1e")
+    time_frame.pack(pady=10)
+
+    tk.Label(time_frame, text="Randomize Time (HH:MM, 24h):", bg="#1e1e1e", fg="white",
+             font=("Segoe UI", 10)).grid(row=0, column=0, padx=5, pady=5, sticky="e")
+    randomize_time_var = tk.StringVar(value="00:00")
+    randomize_entry = ttk.Entry(time_frame, textvariable=randomize_time_var, width=8)
+    randomize_entry.grid(row=0, column=1, padx=5, pady=5)
+
+    tk.Label(time_frame, text="Restore Time (HH:MM, 24h):", bg="#1e1e1e", fg="white",
+             font=("Segoe UI", 10)).grid(row=1, column=0, padx=5, pady=5, sticky="e")
+    restore_time_var = tk.StringVar(value="04:00")
+    restore_entry = ttk.Entry(time_frame, textvariable=restore_time_var, width=8)
+    restore_entry.grid(row=1, column=1, padx=5, pady=5)
+
+    # Buttons frame
+    btn_frame = tk.Frame(root, bg="#1e1e1e")
+    btn_frame.pack(pady=10)
+
+    btn_randomize = ttk.Button(btn_frame, text="Randomize", style='Green.TButton')
+    btn_randomize.pack(side=tk.LEFT, padx=10)
+
+    btn_restore = ttk.Button(btn_frame, text="Restore", style='Green.TButton')
+    btn_restore.pack(side=tk.LEFT, padx=10)
+
+    btn_export = ttk.Button(btn_frame, text="Export App Folder", style='Green.TButton')
+    btn_export.pack(side=tk.LEFT, padx=10)
+
+    # Log Text Box
+    log = tk.Text(root, width=80, height=18, bg="#121212", fg="white", insertbackground="white")
+    log.pack(padx=10, pady=10, expand=True, fill="both")
+
+    def get_times():
+        r_time = randomize_time_var.get().strip()
+        res_time = restore_time_var.get().strip()
+        if not validate_time_format(r_time):
+            messagebox.showerror("Invalid Time", f"Randomize Time '{r_time}' is not valid HH:MM format.")
+            return None, None
+        if not validate_time_format(res_time):
+            messagebox.showerror("Invalid Time", f"Restore Time '{res_time}' is not valid HH:MM format.")
+            return None, None
+        return r_time, res_time
+
+    def on_export():
+        prepare_distribution_folder()
+
+    btn_export.config(command=on_export)
+
+    return root, log, btn_randomize, btn_restore, get_times
+
+# ------------ Main ------------
+def main():
+    if not is_admin():
+        script = os.path.abspath(sys.argv[0])
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}"', None, 1)
+        sys.exit()
+
+    root, log_widget, btn_randomize, btn_restore, get_times_func = setup_gui()
+
+    btn_randomize.config(command=lambda: threading.Thread(
+        target=run_operation, args=(log_widget, btn_randomize, btn_restore, True), daemon=True).start())
+    btn_restore.config(command=lambda: threading.Thread(
+        target=run_operation, args=(log_widget, btn_randomize, btn_restore, False), daemon=True).start())
+
+    threading.Thread(target=check_for_update, args=(root, log_widget), daemon=True).start()
+    threading.Thread(target=scheduler_thread, args=(log_widget, btn_randomize, btn_restore, get_times_func), daemon=True).start()
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
